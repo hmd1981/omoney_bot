@@ -1,0 +1,6 @@
+APScheduler==3.11.0
+Pillow==11.3.0
+requests==2.32.4
+boto3==1.35.99
+arabic-reshaper==3.0.0
+python-bidi==0.6.6
