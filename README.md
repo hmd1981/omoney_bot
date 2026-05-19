@@ -59,6 +59,32 @@ Send the newest existing PNG from `output/` without regenerating:
 docker compose run --rm omoney-rates-bot python -m app.main --send-latest
 ```
 
+Generate and publish branded content posts:
+
+```bash
+docker compose run --rm omoney-rates-bot python -m app.main --content-preview
+docker compose run --rm omoney-rates-bot python -m app.main --content-send
+docker compose run --rm omoney-rates-bot python -m app.main --content-schedule-status
+```
+
+Optional OpenAI-backed content image generation:
+
+```bash
+docker compose run --rm omoney-rates-bot python -m app.main --content-ai-preview
+docker compose run --rm omoney-rates-bot python -m app.main --content-ai-send
+```
+
+OpenAI content generation is optional. Set these values in `.env` to enable it:
+
+```env
+CONTENT_IMAGE_PROVIDER=openai
+CONTENT_AI_IMAGE_ENABLED=true
+OPENAI_API_KEY=
+OPENAI_IMAGE_MODEL=gpt-image-2
+```
+
+If OpenAI is not configured, scheduled content posts keep using the local Pillow generator.
+
 Publish one Instagram feed test post from the current public preview image URL:
 
 ```bash

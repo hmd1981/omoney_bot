@@ -28,6 +28,9 @@ class R2StorageClient:
         )
 
     def upload_png(self, image_path: Path, key: str) -> str:
+        return self.upload_file(image_path=image_path, key=key, content_type="image/png")
+
+    def upload_file(self, image_path: Path, key: str, content_type: str) -> str:
         if not image_path.exists() or not image_path.is_file():
             raise FileNotFoundError(f"image file does not exist: {image_path}")
         normalized_key = key.lstrip("/")
@@ -36,7 +39,7 @@ class R2StorageClient:
             self._bucket,
             normalized_key,
             ExtraArgs={
-                "ContentType": "image/png",
+                "ContentType": content_type,
                 "CacheControl": "public, max-age=60",
             },
         )

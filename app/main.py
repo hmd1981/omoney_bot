@@ -9,7 +9,18 @@ from zoneinfo import ZoneInfo
 import requests
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
+from PIL import Image
 
+from app.content_posts.content_scheduler import (
+    content_enabled,
+    content_publish_times,
+    generate_ai_content_preview,
+    generate_content_preview,
+    last_content_successes,
+    next_content_run,
+    publish_ai_content_post,
+    publish_content_post,
+)
 from app.image_generator import generate_rate_image
 from app.instagram_client import InstagramClient
 from app.rate_providers.navasan import NavasanProvider
@@ -154,17 +165,25 @@ def upload_image_to_r2(image_path: Path, key: str = "latest.png") -> str:
     return client.upload_png(image_path=image_path, key=key)
 
 
+def upload_instagram_image_to_r2(image_path: Path, key: str = "instagram/latest.jpg") -> str:
+    client = R2StorageClient(
+        endpoint_url=required_env("R2_ENDPOINT_URL"),
+        bucket=required_env("R2_BUCKET"),
+        access_key_id=required_env("R2_ACCESS_KEY_ID"),
+        secret_access_key=required_env("R2_SECRET_ACCESS_KEY"),
+        public_base_url=required_env("R2_PUBLIC_BASE_URL"),
+    )
+    jpeg_path = OUTPUT_DIR / "instagram-upload.jpg"
+    with Image.open(image_path) as image:
+        image.convert("RGB").save(jpeg_path, "JPEG", quality=94, optimize=True, progressive=False)
+    return client.upload_file(image_path=jpeg_path, key=key, content_type="image/jpeg")
+
+
 def publish_instagram_image(image_path: Path, caption: str, *, upload: bool = True) -> str:
     if not instagram_enabled():
         raise RuntimeError("INSTAGRAM_ENABLED must be true")
-    image_url = upload_image_to_r2(image_path) if upload else required_env("INSTAGRAM_IMAGE_PUBLIC_URL")
+    image_url = upload_instagram_image_to_r2(image_path) if upload else required_env("INSTAGRAM_IMAGE_PUBLIC_URL")
     verify_public_image_url(image_url)
-    configured_url = os.getenv("INSTAGRAM_IMAGE_PUBLIC_URL", "").strip()
-    if configured_url and configured_url != image_url:
-        raise RuntimeError(
-            "INSTAGRAM_IMAGE_PUBLIC_URL_MISMATCH: "
-            f"configured={configured_url} uploaded={image_url}"
-        )
     client = InstagramClient(
         business_account_id=required_env("INSTAGRAM_BUSINESS_ACCOUNT_ID"),
         access_token=required_env("INSTAGRAM_ACCESS_TOKEN"),
@@ -280,7 +299,7 @@ def publish_scheduled_slot(slot: str | None = None) -> dict:
         record["instagram_duplicate_skipped"] = True
     elif instagram_enabled():
         try:
-            media_id = publish_instagram_image(image_path=image_path, caption=CAPTION, upload=not bool(image_url))
+            media_id = publish_instagram_image(image_path=image_path, caption=CAPTION, upload=True)
             record["instagram_published"] = True
             record["instagram_media_id"] = media_id
         except Exception as exc:
@@ -333,6 +352,43 @@ def print_schedule_status() -> None:
     print(f"last_success_instagram={successes['instagram'] or 'none'}")
 
 
+def print_content_schedule_status() -> None:
+    successes = last_content_successes()
+    print(f"timezone={timezone_name()}")
+    print("content_enabled=" + str(content_enabled()).lower())
+    print("content_publish_times=" + ",".join(content_publish_times()))
+    print(f"next_content_run={next_content_run(timezone_name())}")
+    print("telegram_enabled=" + str(bool(os.getenv("TELEGRAM_CHANNEL", "").strip())).lower())
+    print("instagram_enabled=" + str(instagram_enabled()).lower())
+    print(f"last_content_success_telegram={successes['telegram'] or 'none'}")
+    print(f"last_content_success_instagram={successes['instagram'] or 'none'}")
+
+
+def send_content_telegram(image_path: Path, caption: str) -> str:
+    return send_existing_image(image_path, caption)
+
+
+def publish_content_now(scheduled_time: str | None = None) -> dict:
+    return publish_content_post(
+        timezone=timezone_name(),
+        scheduled_time=scheduled_time,
+        send_telegram=send_content_telegram,
+        publish_instagram=publish_instagram_image,
+        upload_image=upload_image_to_r2,
+        verify_public_url=verify_public_image_url,
+    )
+
+
+def publish_ai_content_now() -> dict:
+    return publish_ai_content_post(
+        timezone=timezone_name(),
+        send_telegram=send_content_telegram,
+        publish_instagram=publish_instagram_image,
+        upload_image=upload_image_to_r2,
+        verify_public_url=verify_public_image_url,
+    )
+
+
 def run_scheduler() -> None:
     timezone_value = timezone_name()
     schedules = publish_times()
@@ -351,6 +407,20 @@ def run_scheduler() -> None:
             max_instances=1,
             coalesce=True,
         )
+    if content_enabled():
+        for item in content_publish_times():
+            hour_text, minute_text = item.split(":", 1)
+            hour = int(hour_text)
+            minute = int(minute_text)
+            scheduler.add_job(
+                lambda scheduled_time=item: publish_content_now(scheduled_time),
+                CronTrigger(hour=hour, minute=minute, timezone=timezone_value),
+                id=f"content-publish-{hour:02d}{minute:02d}",
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+            )
+        log.info("content scheduler enabled timezone=%s times=%s", timezone_value, ",".join(content_publish_times()))
     log.info("scheduler started timezone=%s times=%s", timezone_value, ",".join(schedules))
     scheduler.start()
 
@@ -365,6 +435,11 @@ def main() -> None:
     parser.add_argument("--instagram-test", action="store_true", help="Generate preview image and publish one Instagram feed test post")
     parser.add_argument("--print-caption", action="store_true", help="Print the unified publishing caption")
     parser.add_argument("--schedule-status", action="store_true", help="Print scheduler status")
+    parser.add_argument("--content-preview", action="store_true", help="Generate one premium content image without publishing")
+    parser.add_argument("--content-send", action="store_true", help="Generate and publish one premium content image")
+    parser.add_argument("--content-ai-preview", action="store_true", help="Generate one OpenAI-backed premium content image without publishing")
+    parser.add_argument("--content-ai-send", action="store_true", help="Generate and publish one OpenAI-backed premium content image")
+    parser.add_argument("--content-schedule-status", action="store_true", help="Print content scheduler status")
     args = parser.parse_args()
     if args.fetch_test:
         result = NavasanProvider(CACHE_FILE).fetch_test()
@@ -376,6 +451,59 @@ def main() -> None:
         return
     if args.schedule_status:
         print_schedule_status()
+        return
+    if args.content_schedule_status:
+        print_content_schedule_status()
+        return
+    if args.content_preview:
+        image_path, metadata, caption = generate_content_preview(timezone_name())
+        from PIL import Image
+        with Image.open(image_path) as image:
+            print(f"output={image_path}")
+            print(f"resolution={image.size[0]}x{image.size[1]}")
+        print(f"selected_theme={metadata['selected_theme']}")
+        print(f"selected_visual_preset={metadata['selected_visual_preset']}")
+        print("caption_preview=" + caption.splitlines()[0])
+        return
+    if args.content_ai_preview:
+        try:
+            image_path, metadata, caption = generate_ai_content_preview(timezone_name())
+        except RuntimeError as exc:
+            raise SystemExit(f"error: {exc}") from None
+        from PIL import Image
+        with Image.open(image_path) as image:
+            print(f"output={image_path}")
+            print(f"resolution={image.size[0]}x{image.size[1]}")
+        print(f"content_image_provider={metadata.get('content_image_provider', '')}")
+        print(f"selected_theme={metadata.get('selected_theme', '')}")
+        print(f"selected_ai_prompt_theme={metadata.get('selected_ai_prompt_theme', '')}")
+        print(f"ai_image_generated={str(metadata.get('ai_image_generated', False)).lower()}")
+        print("caption_preview=" + caption.splitlines()[0])
+        return
+    if args.content_send:
+        record = publish_content_now()
+        print("content_generated=" + str(record.get("content_generated", False)).lower())
+        print("telegram_sent=" + str(record.get("telegram_sent", False)).lower())
+        print("instagram_published=" + str(record.get("instagram_published", False)).lower())
+        print(f"selected_theme={record.get('selected_theme', '')}")
+        print(f"selected_visual_preset={record.get('selected_visual_preset', '')}")
+        print(f"image_path={record.get('image_path', '')}")
+        print(f"r2_url={record.get('r2_url', '')}")
+        if record.get("errors"):
+            print("errors=" + json.dumps(record["errors"], ensure_ascii=False, sort_keys=True))
+        return
+    if args.content_ai_send:
+        record = publish_ai_content_now()
+        print("content_image_provider=" + str(record.get("content_image_provider", "")))
+        print("ai_image_generated=" + str(record.get("ai_image_generated", False)).lower())
+        print("telegram_sent=" + str(record.get("telegram_sent", False)).lower())
+        print("instagram_published=" + str(record.get("instagram_published", False)).lower())
+        print(f"selected_theme={record.get('selected_theme', '')}")
+        print(f"selected_ai_prompt_theme={record.get('selected_ai_prompt_theme', '')}")
+        print(f"image_path={record.get('image_path', '')}")
+        print(f"r2_url={record.get('r2_url', '')}")
+        if record.get("errors"):
+            print("errors=" + json.dumps(record["errors"], ensure_ascii=False, sort_keys=True))
         return
     if args.send_now:
         publish_once()
