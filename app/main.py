@@ -1,7 +1,8 @@
 import argparse
+import json
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -19,6 +20,7 @@ BASE_DIR = Path("/app")
 CACHE_FILE = BASE_DIR / "cache" / "last_rates.json"
 OUTPUT_DIR = BASE_DIR / "output"
 LOG_DIR = BASE_DIR / "logs"
+PUBLISHED_SLOTS_FILE = LOG_DIR / "published-slots.jsonl"
 
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
@@ -56,16 +58,34 @@ def required_env(name: str) -> str:
     return value
 
 
+def timezone_name() -> str:
+    return os.getenv("TIMEZONE", "Asia/Muscat").strip() or "Asia/Muscat"
+
+
+def publish_times() -> list[str]:
+    configured = os.getenv("PUBLISH_TIMES", "").strip()
+    if configured:
+        return [item.strip() for item in configured.split(",") if item.strip()]
+    hour = int(os.getenv("PUBLISH_HOUR", "09"))
+    minute = int(os.getenv("PUBLISH_MINUTE", "00"))
+    return [f"{hour:02d}:{minute:02d}"]
+
+
+def current_slot(now: datetime | None = None) -> str:
+    zone = ZoneInfo(timezone_name())
+    when = now or datetime.now(zone)
+    return when.strftime("%Y-%m-%dT%H:%M")
+
+
 def preview_path() -> Path:
     return OUTPUT_DIR / "premium-reference-style-preview.png"
 
 
-def generate_preview() -> tuple[Path, list[dict]]:
-    timezone = ZoneInfo(os.getenv("TIMEZONE", "Asia/Muscat"))
-    now = datetime.now(timezone)
+def generate_image(image_path: Path) -> tuple[list[dict], bool]:
+    zone = ZoneInfo(timezone_name())
+    now = datetime.now(zone)
     provider = NavasanProvider(CACHE_FILE)
     rates, used_cache = provider.fetch()
-    image_path = preview_path()
     generate_rate_image(
         rates=rates,
         image_path=image_path,
@@ -76,6 +96,12 @@ def generate_preview() -> tuple[Path, list[dict]]:
         published_at=now,
         update_note="Last cached update" if used_cache else "",
     )
+    return rates, used_cache
+
+
+def generate_preview() -> tuple[Path, list[dict]]:
+    image_path = preview_path()
+    rates, _ = generate_image(image_path)
     return image_path, rates
 
 
@@ -128,10 +154,10 @@ def upload_image_to_r2(image_path: Path, key: str = "latest.png") -> str:
     return client.upload_png(image_path=image_path, key=key)
 
 
-def publish_instagram_image(image_path: Path, caption: str) -> str:
+def publish_instagram_image(image_path: Path, caption: str, *, upload: bool = True) -> str:
     if not instagram_enabled():
         raise RuntimeError("INSTAGRAM_ENABLED must be true")
-    image_url = upload_image_to_r2(image_path)
+    image_url = upload_image_to_r2(image_path) if upload else required_env("INSTAGRAM_IMAGE_PUBLIC_URL")
     verify_public_image_url(image_url)
     configured_url = os.getenv("INSTAGRAM_IMAGE_PUBLIC_URL", "").strip()
     if configured_url and configured_url != image_url:
@@ -144,11 +170,7 @@ def publish_instagram_image(image_path: Path, caption: str) -> str:
         access_token=required_env("INSTAGRAM_ACCESS_TOKEN"),
         base_url=os.getenv("INSTAGRAM_API_BASE_URL", "https://graph.facebook.com").strip(),
     )
-    media_id = client.publish_image(
-        image_url=image_url,
-        caption=caption,
-    )
-    return media_id
+    return client.publish_image(image_url=image_url, caption=caption)
 
 
 def publish_instagram_preview() -> tuple[Path, list[dict], str]:
@@ -157,54 +179,179 @@ def publish_instagram_preview() -> tuple[Path, list[dict], str]:
     return image_path, rates, media_id
 
 
-def publish_once() -> Path:
-    timezone = ZoneInfo(os.getenv("TIMEZONE", "Asia/Muscat"))
-    now = datetime.now(timezone)
-    provider = NavasanProvider(CACHE_FILE)
-    rates, used_cache = provider.fetch()
+def load_slot_records() -> list[dict]:
+    if not PUBLISHED_SLOTS_FILE.exists():
+        return []
+    records: list[dict] = []
+    for line in PUBLISHED_SLOTS_FILE.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError:
+            log.warning("ignored invalid published slot record")
+    return records
+
+
+def append_slot_record(record: dict) -> None:
+    PUBLISHED_SLOTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with PUBLISHED_SLOTS_FILE.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def slot_already_completed(slot: str) -> bool:
+    for record in load_slot_records():
+        if record.get("scheduled_slot") == slot and record.get("telegram_sent") and record.get("instagram_published"):
+            return True
+    return False
+
+
+def slot_channel_successes(slot: str) -> dict[str, bool]:
+    successes = {"telegram": False, "instagram": False}
+    for record in load_slot_records():
+        if record.get("scheduled_slot") != slot:
+            continue
+        if record.get("telegram_sent"):
+            successes["telegram"] = True
+        if record.get("instagram_published"):
+            successes["instagram"] = True
+    return successes
+
+
+def publish_scheduled_slot(slot: str | None = None) -> dict:
+    slot_id = slot or current_slot()
+    prior_successes = slot_channel_successes(slot_id)
+    record = {
+        "scheduled_slot": slot_id,
+        "timestamp": datetime.now(ZoneInfo(timezone_name())).isoformat(),
+        "rates_fetched": False,
+        "cached": False,
+        "image_generated": False,
+        "r2_uploaded": False,
+        "telegram_sent": False,
+        "instagram_published": False,
+        "errors": {},
+    }
+    if slot_already_completed(slot_id):
+        record["duplicate_skipped"] = True
+        append_slot_record(record)
+        log.info("scheduled_publish %s", json.dumps(record, ensure_ascii=False, sort_keys=True))
+        return record
+
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    image_path = OUTPUT_DIR / f"omoney-rates-{now:%Y%m%d-%H%M%S}.png"
-    generate_rate_image(
-        rates=rates,
-        image_path=image_path,
-        title="Iran Exchange Rates",
-        subtitle="Daily market snapshot",
-        website=os.getenv("WEBSITE", "https://omoney.online"),
-        phone=os.getenv("PHONE", "+96896129711"),
-        published_at=now,
-        update_note="Last cached update" if used_cache else "",
-    )
-    client = TelegramClient(required_env("BOT_TOKEN"))
-    channel = required_env("TELEGRAM_CHANNEL")
-    client.send_photo(channel=channel, image_path=image_path, caption=CAPTION)
-    log.info("published telegram image=%s channel=%s", image_path.name, channel)
-    if instagram_enabled():
-        media_id = publish_instagram_image(image_path=image_path, caption=CAPTION)
-        log.info("published instagram image=%s media_id=%s", image_path.name, media_id)
-    return image_path
+    image_path = OUTPUT_DIR / f"omoney-rates-{slot_id.replace(':', '').replace('-', '').replace('T', '-')}.png"
+
+    try:
+        rates, used_cache = generate_image(image_path)
+        record["rates_fetched"] = True
+        record["cached"] = used_cache
+        record["image_generated"] = image_path.exists()
+        record["symbols"] = [str(rate.get("symbol", "")) for rate in rates]
+    except Exception as exc:
+        record["errors"]["generation"] = str(exc)
+        append_slot_record(record)
+        log.error("scheduled_publish %s", json.dumps(record, ensure_ascii=False, sort_keys=True))
+        return record
+
+    image_url = ""
+    if instagram_enabled() and not prior_successes["instagram"]:
+        try:
+            image_url = upload_image_to_r2(image_path)
+            verify_public_image_url(image_url)
+            record["r2_uploaded"] = True
+            record["image_url"] = image_url
+        except Exception as exc:
+            record["errors"]["r2"] = str(exc)
+    else:
+        record["r2_uploaded"] = False
+
+    if prior_successes["telegram"]:
+        record["telegram_sent"] = True
+        record["telegram_duplicate_skipped"] = True
+    else:
+        try:
+            send_existing_image(image_path, CAPTION)
+            record["telegram_sent"] = True
+        except Exception as exc:
+            record["errors"]["telegram"] = str(exc)
+
+    if instagram_enabled() and prior_successes["instagram"]:
+        record["instagram_published"] = True
+        record["instagram_duplicate_skipped"] = True
+    elif instagram_enabled():
+        try:
+            media_id = publish_instagram_image(image_path=image_path, caption=CAPTION, upload=not bool(image_url))
+            record["instagram_published"] = True
+            record["instagram_media_id"] = media_id
+        except Exception as exc:
+            record["errors"]["instagram"] = str(exc)
+
+    append_slot_record(record)
+    level = logging.INFO if record["telegram_sent"] and (record["instagram_published"] or not instagram_enabled()) else logging.ERROR
+    log.log(level, "scheduled_publish %s", json.dumps(record, ensure_ascii=False, sort_keys=True))
+    return record
+
+
+def publish_once() -> Path:
+    record = publish_scheduled_slot(current_slot())
+    slot = str(record.get("scheduled_slot", current_slot()))
+    return OUTPUT_DIR / f"omoney-rates-{slot.replace(':', '').replace('-', '').replace('T', '-')}.png"
+
+
+def next_scheduled_run(now: datetime | None = None) -> str:
+    zone = ZoneInfo(timezone_name())
+    current = now or datetime.now(zone)
+    candidates: list[datetime] = []
+    for item in publish_times():
+        hour_text, minute_text = item.split(":", 1)
+        candidate = current.replace(hour=int(hour_text), minute=int(minute_text), second=0, microsecond=0)
+        if candidate <= current:
+            candidate = candidate + timedelta(days=1)
+        candidates.append(candidate)
+    return min(candidates).isoformat() if candidates else ""
+
+
+def last_success_by_channel() -> dict:
+    result = {"telegram": "", "instagram": ""}
+    for record in load_slot_records():
+        slot = str(record.get("scheduled_slot", ""))
+        if record.get("telegram_sent"):
+            result["telegram"] = slot
+        if record.get("instagram_published"):
+            result["instagram"] = slot
+    return result
+
+
+def print_schedule_status() -> None:
+    successes = last_success_by_channel()
+    print(f"timezone={timezone_name()}")
+    print("publish_times=" + ",".join(publish_times()))
+    print(f"next_scheduled_run={next_scheduled_run()}")
+    print("telegram_enabled=" + str(bool(os.getenv("TELEGRAM_CHANNEL", "").strip())).lower())
+    print("instagram_enabled=" + str(instagram_enabled()).lower())
+    print(f"last_success_telegram={successes['telegram'] or 'none'}")
+    print(f"last_success_instagram={successes['instagram'] or 'none'}")
 
 
 def run_scheduler() -> None:
-    timezone_name = os.getenv("TIMEZONE", "Asia/Muscat")
-    publish_times = os.getenv("PUBLISH_TIMES", "").strip()
-    if publish_times:
-        schedules = [item.strip() for item in publish_times.split(",") if item.strip()]
-    else:
-        schedules = [f"{int(os.getenv('PUBLISH_HOUR', '09')):02d}:{int(os.getenv('PUBLISH_MINUTE', '00')):02d}"]
-    scheduler = BlockingScheduler(timezone=timezone_name)
+    timezone_value = timezone_name()
+    schedules = publish_times()
+    scheduler = BlockingScheduler(timezone=timezone_value)
     for item in schedules:
         hour_text, minute_text = item.split(":", 1)
         hour = int(hour_text)
         minute = int(minute_text)
         scheduler.add_job(
-            publish_once,
-            CronTrigger(hour=hour, minute=minute, timezone=timezone_name),
+            lambda scheduled_time=item: publish_scheduled_slot(
+                datetime.now(ZoneInfo(timezone_value)).strftime("%Y-%m-%d") + "T" + scheduled_time
+            ),
+            CronTrigger(hour=hour, minute=minute, timezone=timezone_value),
             id=f"daily-rate-publish-{hour:02d}{minute:02d}",
             replace_existing=True,
             max_instances=1,
             coalesce=True,
         )
-    log.info("scheduler started timezone=%s times=%s", timezone_name, ",".join(schedules))
+    log.info("scheduler started timezone=%s times=%s", timezone_value, ",".join(schedules))
     scheduler.start()
 
 
@@ -216,11 +363,19 @@ def main() -> None:
     parser.add_argument("--preview-send", action="store_true", help="Generate preview image and send it to Telegram")
     parser.add_argument("--send-latest", action="store_true", help="Send newest PNG from output without regenerating")
     parser.add_argument("--instagram-test", action="store_true", help="Generate preview image and publish one Instagram feed test post")
+    parser.add_argument("--print-caption", action="store_true", help="Print the unified publishing caption")
+    parser.add_argument("--schedule-status", action="store_true", help="Print scheduler status")
     args = parser.parse_args()
     if args.fetch_test:
         result = NavasanProvider(CACHE_FILE).fetch_test()
         log.info("fetch test source=%s count=%s symbols=%s", result["source"], result["count"], result["symbols"])
         print(f"source={result['source']} count={result['count']} symbols={result['symbols']}")
+        return
+    if args.print_caption:
+        print(CAPTION)
+        return
+    if args.schedule_status:
+        print_schedule_status()
         return
     if args.send_now:
         publish_once()
