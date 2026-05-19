@@ -1,0 +1,14 @@
+{
+  "title": "Iran Exchange Rates",
+  "subtitle": "Daily market snapshot",
+  "caption": "Daily exchange-rate update",
+  "rates": [
+    {"label": "USD", "value": "92,500", "unit": "IRR", "note": "Sample local data"},
+    {"label": "EUR", "value": "100,800", "unit": "IRR"},
+    {"label": "AED", "value": "25,190", "unit": "IRR"},
+    {"label": "OMR", "value": "240,260", "unit": "IRR"},
+    {"label": "TRY", "value": "2,870", "unit": "IRR"},
+    {"label": "Gold 18K", "value": "7,420,000", "unit": "IRR"},
+    {"label": "Coin", "value": "82,600,000", "unit": "IRR"}
+  ]
+}

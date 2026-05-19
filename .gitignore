@@ -1,0 +1,17 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+cache/
+logs/
+output/
+backups/
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.log

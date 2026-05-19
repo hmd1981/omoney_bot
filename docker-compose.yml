@@ -1,0 +1,14 @@
+services:
+  omoney-rates-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: omoney-rates-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data:ro
+      - ./cache:/app/cache
+      - ./output:/app/output
+      - ./logs:/app/logs
