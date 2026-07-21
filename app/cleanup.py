@@ -72,9 +72,9 @@ def related_media_paths(image_path: Path) -> list[Path]:
     raw_path = image_path.with_name(f"{image_path.stem}-openai-raw.png")
     if _is_media_file(raw_path):
         paths.append(raw_path)
-    instagram_jpeg = OUTPUT_DIR / "instagram-upload.jpg"
-    if _is_media_file(instagram_jpeg):
-        paths.append(instagram_jpeg)
+    slot_instagram_jpeg = image_path.with_name(f"{image_path.stem}-instagram.jpg")
+    if _is_media_file(slot_instagram_jpeg):
+        paths.append(slot_instagram_jpeg)
     return paths
 
 

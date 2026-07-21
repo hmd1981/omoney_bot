@@ -6,6 +6,15 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from app.rate_caption_rotation import build_rate_caption
+from app.rate_image_handoff import (
+    assert_canonical_hash_unchanged,
+    assert_telegram_instagram_hash_match,
+    build_instagram_jpeg_from_canonical,
+    log_rate_image_handoff,
+    sha256_file,
+)
+
 import requests
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -167,7 +176,7 @@ def upload_image_to_r2(image_path: Path, key: str = "latest.png") -> str:
     return client.upload_png(image_path=image_path, key=key)
 
 
-def upload_instagram_image_to_r2(image_path: Path, key: str = "instagram/latest.jpg") -> str:
+def upload_instagram_jpeg_to_r2(jpeg_path: Path, key: str = "instagram/latest.jpg", *, cache_version: str = "") -> str:
     client = R2StorageClient(
         endpoint_url=required_env("R2_ENDPOINT_URL"),
         bucket=required_env("R2_BUCKET"),
@@ -175,16 +184,33 @@ def upload_instagram_image_to_r2(image_path: Path, key: str = "instagram/latest.
         secret_access_key=required_env("R2_SECRET_ACCESS_KEY"),
         public_base_url=required_env("R2_PUBLIC_BASE_URL"),
     )
-    jpeg_path = OUTPUT_DIR / "instagram-upload.jpg"
-    with Image.open(image_path) as image:
-        image.convert("RGB").save(jpeg_path, "JPEG", quality=94, optimize=True, progressive=False)
-    return client.upload_file(image_path=jpeg_path, key=key, content_type="image/jpeg")
+    image_url = client.upload_file(image_path=jpeg_path, key=key, content_type="image/jpeg")
+    if cache_version:
+        separator = "&" if "?" in image_url else "?"
+        image_url = f"{image_url}{separator}v={cache_version}"
+    return image_url
 
 
-def publish_instagram_image(image_path: Path, caption: str, *, upload: bool = True) -> str:
+def publish_instagram_image(
+    image_path: Path,
+    caption: str,
+    *,
+    upload: bool = True,
+    canonical_hash: str | None = None,
+) -> str:
     if not instagram_enabled():
         raise RuntimeError("INSTAGRAM_ENABLED must be true")
-    image_url = upload_instagram_image_to_r2(image_path) if upload else required_env("INSTAGRAM_IMAGE_PUBLIC_URL")
+    canonical = image_path.resolve()
+    expected_hash = canonical_hash or sha256_file(canonical)
+    assert_canonical_hash_unchanged(canonical, expected_hash)
+    instagram_hash = sha256_file(canonical)
+    assert_telegram_instagram_hash_match(expected_hash, instagram_hash)
+    jpeg_path = build_instagram_jpeg_from_canonical(canonical)
+    log_rate_image_handoff("instagram", jpeg_path, instagram_hash)
+    if upload:
+        image_url = upload_instagram_jpeg_to_r2(jpeg_path, cache_version=instagram_hash[:16])
+    else:
+        image_url = required_env("INSTAGRAM_IMAGE_PUBLIC_URL")
     verify_public_image_url(image_url)
     client = InstagramClient(
         business_account_id=required_env("INSTAGRAM_BUSINESS_ACCOUNT_ID"),
@@ -196,8 +222,16 @@ def publish_instagram_image(image_path: Path, caption: str, *, upload: bool = Tr
 
 def publish_instagram_preview() -> tuple[Path, list[dict], str]:
     image_path, rates = generate_preview()
-    media_id = publish_instagram_image(image_path=image_path, caption=CAPTION)
-    return image_path, rates, media_id
+    canonical = image_path.resolve()
+    canonical_hash = sha256_file(canonical)
+    slot_id = current_slot()
+    log_rate_image_handoff("telegram", canonical, canonical_hash)
+    media_id = publish_instagram_image(
+        image_path=canonical,
+        caption=build_rate_caption("instagram", slot_id),
+        canonical_hash=canonical_hash,
+    )
+    return canonical, rates, media_id
 
 
 def load_slot_records() -> list[dict]:
@@ -274,24 +308,22 @@ def publish_scheduled_slot(slot: str | None = None) -> dict:
         log.error("scheduled_publish %s", json.dumps(record, ensure_ascii=False, sort_keys=True))
         return record
 
-    image_url = ""
-    if instagram_enabled() and not prior_successes["instagram"]:
-        try:
-            image_url = upload_image_to_r2(image_path)
-            verify_public_image_url(image_url)
-            record["r2_uploaded"] = True
-            record["image_url"] = image_url
-        except Exception as exc:
-            record["errors"]["r2"] = str(exc)
-    else:
-        record["r2_uploaded"] = False
+    canonical = image_path.resolve()
+    record["image_path"] = str(canonical)
+    canonical_hash = sha256_file(canonical)
+    record["telegram_image_hash"] = canonical_hash
+    record["telegram_upload_source"] = str(canonical)
+
+    telegram_caption = build_rate_caption("telegram", slot_id)
+    instagram_caption = build_rate_caption("instagram", slot_id)
 
     if prior_successes["telegram"]:
         record["telegram_sent"] = True
         record["telegram_duplicate_skipped"] = True
     else:
         try:
-            send_existing_image(image_path, CAPTION)
+            log_rate_image_handoff("telegram", canonical, canonical_hash)
+            send_existing_image(canonical, telegram_caption)
             record["telegram_sent"] = True
         except Exception as exc:
             record["errors"]["telegram"] = str(exc)
@@ -301,11 +333,37 @@ def publish_scheduled_slot(slot: str | None = None) -> dict:
         record["instagram_duplicate_skipped"] = True
     elif instagram_enabled():
         try:
-            media_id = publish_instagram_image(image_path=image_path, caption=CAPTION, upload=True)
+            assert_canonical_hash_unchanged(canonical, canonical_hash)
+            instagram_hash = sha256_file(canonical)
+            assert_telegram_instagram_hash_match(canonical_hash, instagram_hash)
+            jpeg_path = build_instagram_jpeg_from_canonical(canonical)
+            record["instagram_upload_source"] = str(jpeg_path)
+            record["instagram_image_hash"] = instagram_hash
+            log_rate_image_handoff("instagram", jpeg_path, instagram_hash)
+            image_url = upload_instagram_jpeg_to_r2(jpeg_path, cache_version=instagram_hash[:16])
+            verify_public_image_url(image_url)
+            record["instagram_public_url"] = image_url
+            client = InstagramClient(
+                business_account_id=required_env("INSTAGRAM_BUSINESS_ACCOUNT_ID"),
+                access_token=required_env("INSTAGRAM_ACCESS_TOKEN"),
+                base_url=os.getenv("INSTAGRAM_API_BASE_URL", "https://graph.facebook.com").strip(),
+            )
+            media_id = client.publish_image(image_url=image_url, caption=instagram_caption)
             record["instagram_published"] = True
             record["instagram_media_id"] = media_id
         except Exception as exc:
             record["errors"]["instagram"] = str(exc)
+
+    if instagram_enabled() and record.get("instagram_published") and not record.get("errors", {}).get("r2"):
+        try:
+            image_url = upload_image_to_r2(canonical, key="latest.png")
+            verify_public_image_url(image_url)
+            record["r2_uploaded"] = True
+            record["image_url"] = image_url
+        except Exception as exc:
+            record["errors"]["r2"] = str(exc)
+    else:
+        record["r2_uploaded"] = False
 
     append_slot_record(record)
     cleanup_after_successful_publish(record, requires_r2=instagram_enabled(), dry_run=False)
@@ -454,7 +512,10 @@ def main() -> None:
         print(f"source={result['source']} count={result['count']} symbols={result['symbols']}")
         return
     if args.print_caption:
-        print(CAPTION)
+        slot_id = current_slot()
+        print(build_rate_caption("telegram", slot_id))
+        print("---")
+        print(build_rate_caption("instagram", slot_id))
         return
     if args.schedule_status:
         print_schedule_status()
@@ -565,7 +626,7 @@ def main() -> None:
         return
     if args.preview_send:
         image_path, rates = generate_preview()
-        channel = send_existing_image(image_path, CAPTION)
+        channel = send_existing_image(image_path, build_rate_caption("telegram", current_slot()))
         print("preview_generated=true")
         print("telegram_sent=true")
         print(f"channel={channel}")
@@ -575,7 +636,7 @@ def main() -> None:
     if args.send_latest:
         image_path = newest_png()
         print(f"selected_image={image_path}")
-        channel = send_existing_image(image_path, CAPTION)
+        channel = send_existing_image(image_path, build_rate_caption("telegram", current_slot()))
         print("telegram_sent=true")
         print(f"channel={channel}")
         print(f"image_path={image_path}")
