@@ -26,7 +26,7 @@ class InstagramClient:
         response = requests.get(
             f"{self._base_url}/{self._business_account_id}",
             params={
-                "fields": "id,username,account_type,media_count",
+                "fields": "id,username,media_count",
                 "access_token": self._access_token,
             },
             timeout=30,
