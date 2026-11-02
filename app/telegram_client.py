@@ -16,3 +16,16 @@ class TelegramClient:
                 timeout=30,
             )
         response.raise_for_status()
+
+    def send_message(self, chat: str, text: str, *, disable_notification: bool = False) -> None:
+        response = requests.post(
+            f"{self._base_url}/sendMessage",
+            data={
+                "chat_id": chat,
+                "text": text,
+                "disable_web_page_preview": True,
+                "disable_notification": disable_notification,
+            },
+            timeout=30,
+        )
+        response.raise_for_status()

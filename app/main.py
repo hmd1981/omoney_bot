@@ -34,6 +34,12 @@ from app.content_posts.content_scheduler import (
 )
 from app.image_generator import generate_rate_image
 from app.instagram_client import InstagramClient
+from app.instagram_token import (
+    InstagramTokenStatus,
+    inspect_access_token,
+    refresh_long_lived_token,
+)
+from app.ops_alerts import send_alert
 from app.rate_providers.navasan import NavasanProvider
 from app.storage_client import R2StorageClient
 from app.telegram_client import TelegramClient
@@ -145,6 +151,93 @@ def newest_png() -> Path:
 
 def instagram_enabled() -> bool:
     return os.getenv("INSTAGRAM_ENABLED", "").strip().lower() == "true"
+
+
+def instagram_token_warn_days() -> float:
+    raw = os.getenv("INSTAGRAM_TOKEN_WARN_DAYS", "7").strip()
+    try:
+        return max(float(raw), 0.0)
+    except ValueError:
+        return 7.0
+
+
+def current_instagram_token_status() -> InstagramTokenStatus:
+    return inspect_access_token(
+        access_token=os.getenv("INSTAGRAM_ACCESS_TOKEN", ""),
+        business_account_id=os.getenv("INSTAGRAM_BUSINESS_ACCOUNT_ID", ""),
+        app_id=os.getenv("INSTAGRAM_APP_ID", ""),
+        app_secret=os.getenv("INSTAGRAM_APP_SECRET", ""),
+    )
+
+
+def alert_instagram_token_issue(status: InstagramTokenStatus, *, context: str) -> None:
+    if not instagram_enabled():
+        return
+    last_success = last_success_by_channel()["instagram"] or "none"
+    if not status.valid:
+        send_alert(
+            key="instagram-token-invalid",
+            cooldown_hours=12,
+            message=(
+                "[ALERT] Instagram publishing is blocked\n"
+                f"Context: {context}\n"
+                "Token status: expired or rejected by Meta\n"
+                f"Meta says: {status.error or 'unknown'}\n"
+                f"Last successful Instagram post: {last_success}\n"
+                "Fix: generate a new long-lived INSTAGRAM_ACCESS_TOKEN, update .env, "
+                "restart the bot."
+            ),
+        )
+        return
+    if status.expiring_within(instagram_token_warn_days()):
+        expires_on = status.expires_at.date().isoformat() if status.expires_at else "unknown"
+        send_alert(
+            key=f"instagram-token-expiring-{expires_on}",
+            cooldown_hours=24,
+            message=(
+                "[ALERT] Instagram token expires soon\n"
+                f"Context: {context}\n"
+                f"Expires: {status.expires_text()} ({status.days_remaining_text()} days left)\n"
+                "Renew it before it lapses, otherwise Instagram publishing stops silently."
+            ),
+        )
+
+
+def preflight_instagram_token(*, context: str, alert: bool = True) -> InstagramTokenStatus:
+    if not instagram_enabled():
+        return InstagramTokenStatus(configured=False, valid=False, error="instagram disabled")
+    status = current_instagram_token_status()
+    log.info(
+        "instagram_token_preflight context=%s valid=%s source=%s expires_at=%s days_remaining=%s error=%s",
+        context,
+        status.valid,
+        status.source or "none",
+        status.expires_text(),
+        status.days_remaining_text(),
+        status.error or "none",
+    )
+    if alert:
+        alert_instagram_token_issue(status, context=context)
+    return status
+
+
+def alert_instagram_publish_failure(record: dict, *, pipeline: str) -> None:
+    error = str((record.get("errors") or {}).get("instagram", "")).strip()
+    if not error or not instagram_enabled():
+        return
+    slot = str(record.get("scheduled_slot", ""))
+    telegram_ok = "yes" if record.get("telegram_sent") else "no"
+    send_alert(
+        key=f"instagram-publish-failed-{pipeline}-{slot}",
+        cooldown_hours=1,
+        message=(
+            "[ALERT] Instagram post failed\n"
+            f"Pipeline: {pipeline}\n"
+            f"Slot: {slot}\n"
+            f"Telegram delivered: {telegram_ok}\n"
+            f"Reason: {error[:500]}"
+        ),
+    )
 
 
 def verify_public_image_url(image_url: str) -> None:
@@ -369,6 +462,8 @@ def publish_scheduled_slot(slot: str | None = None) -> dict:
     cleanup_after_successful_publish(record, requires_r2=instagram_enabled(), dry_run=False)
     level = logging.INFO if record["telegram_sent"] and (record["instagram_published"] or not instagram_enabled()) else logging.ERROR
     log.log(level, "scheduled_publish %s", json.dumps(record, ensure_ascii=False, sort_keys=True))
+    if not record.get("instagram_published"):
+        alert_instagram_publish_failure(record, pipeline="rate")
     return record
 
 
@@ -411,6 +506,18 @@ def print_schedule_status() -> None:
     print("instagram_enabled=" + str(instagram_enabled()).lower())
     print(f"last_success_telegram={successes['telegram'] or 'none'}")
     print(f"last_success_instagram={successes['instagram'] or 'none'}")
+    if instagram_enabled():
+        try:
+            token_status = current_instagram_token_status()
+        except Exception as exc:  # noqa: BLE001 - status output must stay usable offline
+            print(f"instagram_token_error={exc}")
+        else:
+            print(f"instagram_token_valid={str(token_status.valid).lower()}")
+            print(f"instagram_token_expires_at={token_status.expires_text()}")
+            print(f"instagram_token_days_remaining={token_status.days_remaining_text()}")
+            if token_status.error:
+                print(f"instagram_token_error={token_status.error}")
+    print("alert_chat_configured=" + str(bool(os.getenv("ALERT_TELEGRAM_CHAT", "").strip())).lower())
 
 
 def print_content_schedule_status() -> None:
@@ -430,7 +537,7 @@ def send_content_telegram(image_path: Path, caption: str) -> str:
 
 
 def publish_content_now(scheduled_time: str | None = None) -> dict:
-    return publish_content_post(
+    record = publish_content_post(
         timezone=timezone_name(),
         scheduled_time=scheduled_time,
         send_telegram=send_content_telegram,
@@ -438,16 +545,22 @@ def publish_content_now(scheduled_time: str | None = None) -> dict:
         upload_image=upload_image_to_r2,
         verify_public_url=verify_public_image_url,
     )
+    if not record.get("instagram_published") and not record.get("duplicate_skipped"):
+        alert_instagram_publish_failure(record, pipeline="content")
+    return record
 
 
 def publish_ai_content_now() -> dict:
-    return publish_ai_content_post(
+    record = publish_ai_content_post(
         timezone=timezone_name(),
         send_telegram=send_content_telegram,
         publish_instagram=publish_instagram_image,
         upload_image=upload_image_to_r2,
         verify_public_url=verify_public_image_url,
     )
+    if not record.get("instagram_published") and not record.get("duplicate_skipped"):
+        alert_instagram_publish_failure(record, pipeline="ai-content")
+    return record
 
 
 def run_scheduler() -> None:
@@ -482,6 +595,25 @@ def run_scheduler() -> None:
                 coalesce=True,
             )
         log.info("content scheduler enabled timezone=%s times=%s", timezone_value, ",".join(content_publish_times()))
+    if instagram_enabled():
+        token_check_time = os.getenv("INSTAGRAM_TOKEN_CHECK_TIME", "09:00").strip()
+        try:
+            hour_text, minute_text = token_check_time.split(":", 1)
+            scheduler.add_job(
+                lambda: preflight_instagram_token(context="scheduled token watch"),
+                CronTrigger(hour=int(hour_text), minute=int(minute_text), timezone=timezone_value),
+                id="instagram-token-watch",
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+            )
+            log.info("instagram token watch enabled time=%s", token_check_time)
+        except ValueError:
+            log.warning("invalid INSTAGRAM_TOKEN_CHECK_TIME=%s, token watch disabled", token_check_time)
+        try:
+            preflight_instagram_token(context="scheduler startup")
+        except Exception as exc:  # noqa: BLE001 - startup must not fail on a Meta outage
+            log.warning("instagram_token_preflight_failed %s", exc)
     log.info("scheduler started timezone=%s times=%s", timezone_value, ",".join(schedules))
     scheduler.start()
 
@@ -501,6 +633,8 @@ def main() -> None:
     parser.add_argument("--content-ai-preview", action="store_true", help="Generate one OpenAI-backed premium content image without publishing")
     parser.add_argument("--content-ai-send", action="store_true", help="Generate and publish one OpenAI-backed premium content image")
     parser.add_argument("--content-schedule-status", action="store_true", help="Print content scheduler status")
+    parser.add_argument("--instagram-token-status", action="store_true", help="Check Instagram token validity and expiry")
+    parser.add_argument("--instagram-token-refresh", action="store_true", help="Extend a still-valid Instagram long-lived token and print the new value")
     parser.add_argument("--cleanup-output", action="store_true", help="Delete stale generated images under /app/output")
     parser.add_argument("--cleanup-output-dry-run", action="store_true", help="Show generated images that would be deleted")
     parser.add_argument("--r2-cleanup-dry-run", action="store_true", help="List old archived R2 media objects eligible for deletion")
@@ -522,6 +656,34 @@ def main() -> None:
         return
     if args.content_schedule_status:
         print_content_schedule_status()
+        return
+    if args.instagram_token_status:
+        status = current_instagram_token_status()
+        print(f"instagram_enabled={str(instagram_enabled()).lower()}")
+        print(f"instagram_token_configured={str(status.configured).lower()}")
+        print(f"instagram_token_valid={str(status.valid).lower()}")
+        print(f"instagram_token_source={status.source or 'none'}")
+        print(f"instagram_token_expires_at={status.expires_text()}")
+        print(f"instagram_token_days_remaining={status.days_remaining_text()}")
+        print(f"instagram_token_scopes={','.join(status.scopes) or 'unknown'}")
+        print(f"instagram_token_warn_days={instagram_token_warn_days()}")
+        print(f"alert_chat_configured={str(bool(os.getenv('ALERT_TELEGRAM_CHAT', '').strip())).lower()}")
+        if status.error:
+            print(f"instagram_token_error={status.error}")
+        raise SystemExit(0 if status.valid else 1)
+    if args.instagram_token_refresh:
+        result = refresh_long_lived_token(
+            os.getenv("INSTAGRAM_ACCESS_TOKEN", ""),
+            app_id=os.getenv("INSTAGRAM_APP_ID", ""),
+            app_secret=os.getenv("INSTAGRAM_APP_SECRET", ""),
+        )
+        if not result.ok:
+            raise SystemExit(f"error: {result.error}")
+        expires_on = result.expires_at.strftime("%Y-%m-%d %H:%M UTC") if result.expires_at else "unknown"
+        print("instagram_token_refreshed=true")
+        print(f"instagram_token_expires_at={expires_on}")
+        print("Set INSTAGRAM_ACCESS_TOKEN in .env to the value below, then restart the bot:")
+        print(result.access_token)
         return
     if args.cleanup_output_dry_run:
         deleted = cleanup_output(dry_run=True)

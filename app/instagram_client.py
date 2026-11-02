@@ -3,6 +3,12 @@ from __future__ import annotations
 import requests
 import time
 
+from app.instagram_token import GraphError, inspect_access_token
+
+
+class InstagramAuthError(RuntimeError):
+    """Raised when Meta rejects the access token itself (expired or invalid)."""
+
 
 class InstagramClient:
     def __init__(
@@ -32,14 +38,23 @@ class InstagramClient:
             timeout=30,
         )
         if not response.ok:
-            raise RuntimeError(
-                "INSTAGRAM_ACCOUNT_NOT_ACCESSIBLE: token cannot read "
-                f"INSTAGRAM_BUSINESS_ACCOUNT_ID={self._business_account_id}. "
-                "Use the Instagram Business/Creator account ID connected to a Facebook Page "
-                "that this token can access, and grant instagram_basic plus "
-                "instagram_content_publish permissions. Meta response: "
-                f"{response.text}"
+            raise self._error_from_response(response, stage="account check")
+
+    def _error_from_response(self, response: requests.Response, *, stage: str) -> RuntimeError:
+        error = GraphError.from_response(response)
+        if error.is_auth_error:
+            return InstagramAuthError(
+                "INSTAGRAM_TOKEN_INVALID: Meta rejected INSTAGRAM_ACCESS_TOKEN as expired or "
+                f"invalid during {stage}. Generate a new long-lived token and update "
+                f"INSTAGRAM_ACCESS_TOKEN, then restart the bot. Meta response: {error.describe()}"
             )
+        return RuntimeError(
+            "INSTAGRAM_ACCOUNT_NOT_ACCESSIBLE: token cannot read "
+            f"INSTAGRAM_BUSINESS_ACCOUNT_ID={self._business_account_id} during {stage}. "
+            "Use the Instagram Business/Creator account ID connected to a Facebook Page "
+            "that this token can access, and grant instagram_basic plus "
+            f"instagram_content_publish permissions. Meta response: {error.describe()}"
+        )
 
     def _create_image_container(self, image_url: str, caption: str) -> str:
         response = requests.post(
@@ -52,7 +67,7 @@ class InstagramClient:
             timeout=30,
         )
         if not response.ok:
-            raise RuntimeError(f"Instagram media container request failed: {response.text}")
+            raise self._error_from_response(response, stage="media container creation")
         payload = response.json()
         container_id = str(payload.get("id", "")).strip()
         if not container_id:
@@ -71,7 +86,7 @@ class InstagramClient:
                 timeout=30,
             )
             if not response.ok:
-                raise RuntimeError(f"Instagram media status request failed: {response.text}")
+                raise self._error_from_response(response, stage="media status polling")
             payload = response.json()
             last_status = str(payload.get("status_code") or payload.get("status") or "").strip()
             if last_status in {"FINISHED", "PUBLISHED"}:
@@ -92,9 +107,17 @@ class InstagramClient:
             timeout=30,
         )
         if not response.ok:
-            raise RuntimeError(f"Instagram publish request failed: {response.text}")
+            raise self._error_from_response(response, stage="media publish")
         payload = response.json()
         media_id = str(payload.get("id", "")).strip()
         if not media_id:
             raise RuntimeError("Instagram publish response did not include id")
         return media_id
+
+    def inspect_token(self, *, app_id: str = "", app_secret: str = ""):
+        return inspect_access_token(
+            access_token=self._access_token,
+            business_account_id=self._business_account_id,
+            app_id=app_id,
+            app_secret=app_secret,
+        )

@@ -95,9 +95,39 @@ docker compose run --rm omoney-rates-bot python -m app.main --instagram-test
 
 Instagram troubleshooting:
 
+- `INSTAGRAM_TOKEN_INVALID` means the access token itself expired or was revoked. Long-lived Instagram tokens last about 60 days. Generate a new token and update `INSTAGRAM_ACCESS_TOKEN`, then restart the bot.
 - `INSTAGRAM_IMAGE_PUBLIC_URL_NOT_REACHABLE` means the configured public URL does not return HTTP 200.
 - `INSTAGRAM_IMAGE_PUBLIC_URL_NOT_IMAGE` means the URL is reachable but does not return an image content type.
-- `INSTAGRAM_ACCOUNT_NOT_ACCESSIBLE` means the token cannot read the configured Instagram business account. Verify the account ID, Facebook Page connection, and granted Meta permissions.
+- `INSTAGRAM_ACCOUNT_NOT_ACCESSIBLE` means the token is valid but cannot read the configured Instagram business account. Verify the account ID, Facebook Page connection, and granted Meta permissions.
+
+## Instagram token health
+
+Long-lived Instagram tokens expire after roughly 60 days, which silently stops Instagram publishing while Telegram keeps working. The bot now checks the token daily and alarms on expiry.
+
+```bash
+# Validity, expiry date, remaining days, granted scopes
+docker compose run --rm omoney-rates-bot python -m app.main --instagram-token-status
+
+# Extend a still-valid token by another ~60 days; prints the new token to paste into .env
+docker compose run --rm omoney-rates-bot python -m app.main --instagram-token-refresh
+```
+
+Alerting configuration (`.env`):
+
+```env
+# Private chat/group that receives operational alarms. Leave empty to only log.
+ALERT_TELEGRAM_CHAT=
+# Warn this many days before the token expires.
+INSTAGRAM_TOKEN_WARN_DAYS=7
+# Daily preflight time in TIMEZONE.
+INSTAGRAM_TOKEN_CHECK_TIME=09:00
+INSTAGRAM_APP_ID=
+INSTAGRAM_APP_SECRET=
+```
+
+`INSTAGRAM_APP_ID` and `INSTAGRAM_APP_SECRET` are optional but recommended: they let the bot read the token's real expiry date through Meta's `debug_token` endpoint instead of inferring it.
+
+Alerts are sent when the token is invalid, when it expires within `INSTAGRAM_TOKEN_WARN_DAYS`, and when any Instagram publish fails. Repeats are cooldown-limited in `logs/alert-state.json`.
 
 ## Health and logs
 
