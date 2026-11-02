@@ -1,10 +1,16 @@
+x-omoney-bot: &omoney-bot
+  image: omoney-rates-bot:latest
+  restart: unless-stopped
+
 services:
+  # Primary account. The public website points at this account's R2 keys
+  # (latest.png, instagram/latest.jpg), so it keeps R2_KEY_PREFIX empty.
   omoney-rates-bot:
+    <<: *omoney-bot
     build:
       context: .
       dockerfile: Dockerfile
     container_name: omoney-rates-bot
-    restart: unless-stopped
     env_file:
       - .env
     volumes:
@@ -12,3 +18,18 @@ services:
       - ./cache:/app/cache
       - ./output:/app/output
       - ./logs:/app/logs
+
+  # Additional accounts are added by scripts/add-account.sh, which appends a
+  # service block with its own env file, state directories, and R2 key prefix.
+  # Example (do not uncomment by hand, use the script):
+  #
+  # omoney-rates-bot-second:
+  #   <<: *omoney-bot
+  #   container_name: omoney-rates-bot-second
+  #   env_file:
+  #     - accounts/second/.env
+  #   volumes:
+  #     - ./accounts/second/data:/app/data:ro
+  #     - ./accounts/second/cache:/app/cache
+  #     - ./accounts/second/output:/app/output
+  #     - ./accounts/second/logs:/app/logs

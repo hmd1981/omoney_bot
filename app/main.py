@@ -258,6 +258,20 @@ def verify_public_image_url(image_url: str) -> None:
         response.close()
 
 
+def r2_key_prefix() -> str:
+    """Namespace R2 object keys so several accounts can share one bucket.
+
+    Empty for the primary account, which keeps the original key layout that
+    the public website points at.
+    """
+    prefix = os.getenv("R2_KEY_PREFIX", "").strip().strip("/")
+    return f"{prefix}/" if prefix else ""
+
+
+def r2_key(key: str) -> str:
+    return f"{r2_key_prefix()}{key.lstrip('/')}"
+
+
 def upload_image_to_r2(image_path: Path, key: str = "latest.png") -> str:
     client = R2StorageClient(
         endpoint_url=required_env("R2_ENDPOINT_URL"),
@@ -266,7 +280,7 @@ def upload_image_to_r2(image_path: Path, key: str = "latest.png") -> str:
         secret_access_key=required_env("R2_SECRET_ACCESS_KEY"),
         public_base_url=required_env("R2_PUBLIC_BASE_URL"),
     )
-    return client.upload_png(image_path=image_path, key=key)
+    return client.upload_png(image_path=image_path, key=r2_key(key))
 
 
 def upload_instagram_jpeg_to_r2(jpeg_path: Path, key: str = "instagram/latest.jpg", *, cache_version: str = "") -> str:
@@ -277,7 +291,7 @@ def upload_instagram_jpeg_to_r2(jpeg_path: Path, key: str = "instagram/latest.jp
         secret_access_key=required_env("R2_SECRET_ACCESS_KEY"),
         public_base_url=required_env("R2_PUBLIC_BASE_URL"),
     )
-    image_url = client.upload_file(image_path=jpeg_path, key=key, content_type="image/jpeg")
+    image_url = client.upload_file(image_path=jpeg_path, key=r2_key(key), content_type="image/jpeg")
     if cache_version:
         separator = "&" if "?" in image_url else "?"
         image_url = f"{image_url}{separator}v={cache_version}"

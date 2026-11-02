@@ -129,6 +129,65 @@ INSTAGRAM_APP_SECRET=
 
 Alerts are sent when the token is invalid, when it expires within `INSTAGRAM_TOKEN_WARN_DAYS`, and when any Instagram publish fails. Repeats are cooldown-limited in `logs/alert-state.json`.
 
+## Multiple Instagram accounts
+
+Each account runs in **its own container** with its own state, logs, and R2 key
+prefix. Isolation is deliberate: a bad token or failed post in one account
+cannot affect the others, and each account keeps independent publish history
+and caption rotation.
+
+Add an account:
+
+```bash
+./scripts/add-account.sh second
+```
+
+That creates `accounts/second/` (data, cache, output, logs) seeded with a
+`.env`, adds a compose service, and sets `R2_KEY_PREFIX=second`. Fill four
+values in `accounts/second/.env`:
+
+```env
+INSTAGRAM_ACCESS_TOKEN=
+INSTAGRAM_BUSINESS_ACCOUNT_ID=
+TELEGRAM_CHANNEL=
+ALERT_TELEGRAM_CHAT=
+```
+
+Verify the token, then start it:
+
+```bash
+docker compose run --rm omoney-rates-bot-second python -m app.main --instagram-token-status
+docker compose up -d --build
+```
+
+Each account has its own `PUBLISH_TIMES` and `CONTENT_PUBLISH_TIMES`, so
+accounts can run on completely different schedules.
+
+R2 key layout:
+
+| Account | Instagram image | Rate PNG | Content PNG |
+|---|---|---|---|
+| primary (`R2_KEY_PREFIX=`) | `instagram/latest.jpg` | `latest.png` | `content/latest.png` |
+| secondary (`R2_KEY_PREFIX=second`) | `second/instagram/latest.jpg` | `second/latest.png` | `second/content/latest.png` |
+
+Keep the primary account's prefix empty: the public website points at
+`latest.png` and `instagram/latest.jpg`.
+
+### Capacity
+
+Measured on this server (2 vCPU, 3.7 GB RAM): one rate post costs ~4.5 s and
+~30 MB peak RSS; an idle bot uses 34 MB. Meta allows **100 published posts per
+24 hours per Instagram account** (check with
+`GET /{ig-user-id}/content_publishing_limit`). At 3 posts/day per account the
+hardware is not the constraint; the per-account Meta quota is.
+
+Monitor all accounts:
+
+```bash
+docker compose ps
+docker compose logs --tail=50 omoney-rates-bot-second
+```
+
 ## Health and logs
 
 ```bash
