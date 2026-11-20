@@ -290,10 +290,37 @@ The Navasan code path and its cache are untouched.
 
 ## Health and logs
 
+One command checks the whole pipeline (read-only — it never publishes,
+changes config, or restarts anything):
+
+```bash
+./scripts/healthcheck.sh
+```
+
+It verifies the container, provider, key presence, an authenticated
+`/v1/prices` call, the app's own fetch path, R2 storage, the Instagram token,
+and the publish schedule. The API key is reported as a SHA-256 fingerprint and
+last four characters only.
+
 ```bash
 docker compose ps
 docker compose logs --tail=100 omoney-rates-bot
 ```
+
+### Automated alerts
+
+Scheduled runs alert the operator chat when something would otherwise fail
+silently:
+
+| Alert | When | Cooldown |
+|---|---|---|
+| `rates-from-cache` | A run publishes the cached snapshot instead of live data (includes cache age) | 6h |
+| `rate-generation-failed` | Rate fetch or image generation raised | 1h |
+| `instagram-token-invalid` / `-expiring-*` | Token rejected or nearing expiry | 12h / 24h |
+| `instagram-publish-failed-*` | An Instagram post failed | 1h |
+
+Cooldowns keep a persistent fault from spamming the operator on every run.
+Alerts go to `ALERT_TELEGRAM_CHAT` (the operator), never to the public channel.
 
 ## Files
 

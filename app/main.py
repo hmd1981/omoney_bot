@@ -2,7 +2,7 @@ import argparse
 import json
 import logging
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -123,6 +123,56 @@ def build_rate_provider():
     if name == "omoney":
         return OmoneyProvider(OMONEY_CACHE_FILE)
     raise RuntimeError(f"CURRENCY_PROVIDER must be 'navasan' or 'omoney' (got {name!r})")
+
+
+def rate_cache_path() -> Path:
+    return OMONEY_CACHE_FILE if rate_provider_name() == "omoney" else CACHE_FILE
+
+
+def rate_cache_age_text() -> str:
+    """Human-readable age of the cached snapshot, or 'unknown'.
+
+    Used in operator alerts so a stale fallback reports how stale it actually
+    is instead of a vague "something failed".
+    """
+    try:
+        payload = json.loads(rate_cache_path().read_text(encoding="utf-8"))
+        raw = payload.get("fetched_at") or payload.get("timestamp") or ""
+        when = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        minutes = int((datetime.now(timezone.utc) - when).total_seconds() // 60)
+        return f"{minutes} min"
+    except Exception:  # noqa: BLE001 - alerting text must never break publishing
+        return "unknown"
+
+
+def alert_rate_fallback(slot_id: str) -> None:
+    send_alert(
+        key="rates-from-cache",
+        cooldown_hours=6,
+        message=(
+            "[ALERT] Publishing stale rates\n"
+            f"Provider: {rate_provider_name()}\n"
+            f"Slot: {slot_id}\n"
+            f"Cache age: {rate_cache_age_text()}\n"
+            "The rate API did not return live data, so the last snapshot was "
+            "used. Check the API key and provider status."
+        ),
+    )
+
+
+def alert_rate_failure(slot_id: str, exc: Exception) -> None:
+    send_alert(
+        key="rate-generation-failed",
+        cooldown_hours=1,
+        message=(
+            "[ALERT] Rate generation failed\n"
+            f"Provider: {rate_provider_name()}\n"
+            f"Slot: {slot_id}\n"
+            f"Error: {exc}"
+        ),
+    )
 
 
 def generate_image(image_path: Path) -> tuple[list[dict], bool]:
@@ -431,8 +481,11 @@ def publish_scheduled_slot(slot: str | None = None) -> dict:
         record["cached"] = used_cache
         record["image_generated"] = image_path.exists()
         record["symbols"] = [str(rate.get("symbol", "")) for rate in rates]
+        if used_cache:
+            alert_rate_fallback(slot_id)
     except Exception as exc:
         record["errors"]["generation"] = str(exc)
+        alert_rate_failure(slot_id, exc)
         append_slot_record(record)
         log.error("scheduled_publish %s", json.dumps(record, ensure_ascii=False, sort_keys=True))
         return record
