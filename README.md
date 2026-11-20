@@ -224,6 +224,47 @@ This exercises the real endpoint and the symbol mapping while the scheduler
 keeps running on the current provider. `--fetch-test` reports
 `provider=`, `source=live|cache`, `count=`, and `symbols=`.
 
+### Verified symbol mapping
+
+Checked against live `GET /v1/instruments` (15 instruments) and
+`GET /v1/prices`:
+
+| App symbol | Omoney instrument | Price field | Unit |
+|---|---|---|---|
+| `usd_sell` | `USD` | `sell_price` | IRT |
+| `cad` | `CAD` | `price` | IRT |
+| `aed_sell` | `AED` | `sell_price` | IRT |
+| `try` | `TRY` | `price` | IRT |
+| `omr` | `OMR` | `price` | IRT |
+| `btc` | `BTC` | `price` | IRT |
+| `usdt` | `USDT` | `price` | IRT |
+| `18ayar` | **none** | — | — |
+
+`usd_sell` / `aed_sell` use `sell_price` because the legacy symbols represent
+the customer sell rate; everything else uses the mid `price`. If `sell_price`
+is missing or `0` the adapter falls back to the mid price rather than
+publishing a zero.
+
+### Units: IRT (toman), not IRR
+
+The Omoney API quotes in **IRT (toman)**, and the adapter labels the image with
+the API's own `quote_currency`. Note that this differs from the old Navasan
+output, which printed toman values under an `IRR` label: the frozen Navasan
+snapshot (`usd_sell=268,600`) and Omoney's live `USD` (`271,150` IRT) agree to
+within market movement, while the AED/USD ratio comes out at `3.6726` against
+the `3.6725` peg. So the numbers were always toman and only the unit label was
+wrong. `GET /v1/prices?quote=IRR` is available if rial is ever required, but the
+API's `unit` text string stays "Toman per..." regardless, so `quote_currency`
+is the field to trust.
+
+### Gold is not available
+
+There is no gram-gold instrument. `XAU` is quoted in USD per troy ounce and
+currently returns `price: null, status: "unavailable"`; `SEKKEH`/`BAHAR` are
+whole coins. Mapping `18ayar` to any of them would mislabel a different
+product, so it is deliberately unmapped and that row is omitted. Add an
+instrument to `OMONEY_SYMBOLS` once a matching one exists.
+
 ### Behaviour
 
 - Bounded timeouts: `OMONEY_FX_CONNECT_TIMEOUT` (5s) and
@@ -239,7 +280,7 @@ keeps running on the current provider. `--fetch-test` reports
   are never silently substituted.
 - Snapshots are cached in `cache/last_rates_omoney.json`, separate from the
   Navasan cache so the two providers' units can never mix.
-- `OMONEY_SYMBOLS` overrides the app_symbol=INSTRUMENT mapping; an unmatched
+- `OMONEY_SYMBOLS` overrides the mapping as app_symbol=INSTRUMENT[:field]; an unmatched
   instrument raises `OMONEY_INSTRUMENT_UNKNOWN` and lists what the API offers.
 
 ### Rollback

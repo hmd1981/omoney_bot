@@ -14,24 +14,30 @@ log = logging.getLogger(__name__)
 
 DEFAULT_BASE_URL = "https://fx.omoney.online"
 
-# App-facing symbol -> Omoney FX instrument code.
+# App-facing symbol -> Omoney FX instrument symbol.
 #
+# Verified against GET /v1/instruments (15 instruments) and GET /v1/prices.
 # The app-facing symbol must stay identical to the Navasan symbol so that
 # image_generator DISPLAY/ORDER tables, caption rotation and the published
 # slot records keep working unchanged.
 #
-# TODO(verify-before-cutover): instrument codes below must be confirmed against
-# GET /v1/instruments. Any mapping that does not resolve raises
-# OMONEY_INSTRUMENT_UNKNOWN instead of silently dropping the row.
-DEFAULT_SYMBOL_MAP: dict[str, str] = {
-    "usd_sell": "USD",
-    "cad": "CAD",
-    "aed_sell": "AED",
-    "try": "TRY",
-    "omr": "OMR",
-    "btc": "BTC",
-    "usdt": "USDT",
-    "18ayar": "GOLD18K",
+# The value is a dict because the Omoney API exposes both a mid price and an
+# explicit sell price. The legacy Navasan symbols ending in "_sell" have always
+# represented the customer sell rate, so they use sell_price.
+#
+# 18ayar (18K gold per gram) has NO Omoney equivalent: there is no gram-gold
+# instrument, XAU is quoted in USD per troy ounce and currently reports
+# status=unavailable with price=null, and SEKKEH/BAHAR are whole coins. It is
+# therefore intentionally absent rather than mapped to a different instrument.
+# Map it explicitly with OMONEY_SYMBOLS only if a matching instrument is added.
+DEFAULT_SYMBOL_MAP: dict[str, dict[str, str]] = {
+    "usd_sell": {"instrument": "USD", "field": "sell_price"},
+    "cad": {"instrument": "CAD", "field": "price"},
+    "aed_sell": {"instrument": "AED", "field": "sell_price"},
+    "try": {"instrument": "TRY", "field": "price"},
+    "omr": {"instrument": "OMR", "field": "price"},
+    "btc": {"instrument": "BTC", "field": "price"},
+    "usdt": {"instrument": "USDT", "field": "price"},
 }
 
 DISPLAY_LABELS = {
@@ -52,11 +58,16 @@ DISPLAY_LABELS = {
 # response before cutover; these exist so a schema change fails with a precise
 # diagnostic rather than a KeyError or, worse, a fabricated price.
 _RECORD_LIST_KEYS = ("prices", "data", "results", "items", "instruments", "rates")
-_SYMBOL_KEYS = ("instrument", "symbol", "code", "ticker", "pair", "slug", "id")
+_SYMBOL_KEYS = ("symbol", "instrument", "code", "ticker", "pair", "slug", "id")
 _PRICE_KEYS = ("price", "value", "last", "rate", "close")
-_UNIT_KEYS = ("quote", "quote_currency", "price_unit", "unit", "currency")
-_TIMESTAMP_KEYS = ("updated_at", "timestamp", "as_of", "last_updated", "price_time", "time")
+_UNIT_KEYS = ("quote_currency", "quote", "price_unit", "currency")
+_TIMESTAMP_KEYS = ("source_updated_at", "observed_at", "updated_at", "timestamp", "as_of", "retrieved_at")
 _STATUS_KEYS = ("status", "state", "freshness")
+
+# Instrument statuses that mean "do not publish this price at all".
+_UNAVAILABLE_STATUSES = {"unavailable", "error", "down", "missing", "nodata"}
+# Instrument statuses that mean "this price is real but not fresh".
+_STALE_STATUSES = {"stale", "expired", "delayed", "outdated"}
 
 
 class OmoneyProviderError(RuntimeError):
@@ -94,6 +105,20 @@ def _first(record: dict, keys: tuple[str, ...]) -> object:
         if key in record and record[key] not in (None, ""):
             return record[key]
     return None
+
+
+def _positive_number(value: object) -> float | None:
+    """Return a strictly positive float, or None for missing/zero/garbage.
+
+    Zero is treated as "not quoted": publishing 0 would be a fabricated price.
+    """
+    if value is None or value == "":
+        return None
+    try:
+        number = float(str(value).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
 
 
 def _parse_iso(value: object) -> datetime | None:
@@ -142,23 +167,29 @@ class OmoneyProvider:
         self.max_attempts = max(1, _env_int("OMONEY_FX_MAX_ATTEMPTS", 3))
         self.max_price_age = timedelta(minutes=_env_float("OMONEY_FX_MAX_PRICE_AGE_MINUTES", 240))
         self.max_retry_sleep = _env_float("OMONEY_FX_MAX_RETRY_SLEEP", 60.0)
+        self.last_stale_symbols: list[str] = []
 
-    def _load_symbol_map(self) -> dict[str, str]:
+    def _load_symbol_map(self) -> dict[str, dict[str, str]]:
         configured = os.getenv("OMONEY_SYMBOLS", "").strip()
         if not configured:
-            return dict(DEFAULT_SYMBOL_MAP)
-        mapping: dict[str, str] = {}
+            return {key: dict(value) for key, value in DEFAULT_SYMBOL_MAP.items()}
+        mapping: dict[str, dict[str, str]] = {}
         for item in configured.split(","):
             item = item.strip()
             if not item:
                 continue
             if "=" not in item:
                 raise OmoneyProviderError(
-                    f"OMONEY_SYMBOLS entry {item!r} must be app_symbol=INSTRUMENT"
+                    f"OMONEY_SYMBOLS entry {item!r} must be app_symbol=INSTRUMENT[:field]"
                 )
-            app_symbol, instrument = item.split("=", 1)
-            mapping[app_symbol.strip()] = instrument.strip()
-        return mapping or dict(DEFAULT_SYMBOL_MAP)
+            app_symbol, spec = item.split("=", 1)
+            app_symbol = app_symbol.strip()
+            instrument, _, field = spec.partition(":")
+            mapping[app_symbol] = {
+                "instrument": instrument.strip(),
+                "field": (field.strip() or "price"),
+            }
+        return mapping or {key: dict(value) for key, value in DEFAULT_SYMBOL_MAP.items()}
 
     # ---------------------------------------------------------------- fetching
 
@@ -175,11 +206,16 @@ class OmoneyProvider:
             try:
                 payload = self._request_prices()
                 rates, stale = self._normalize(payload)
-                if stale and not rates:
-                    raise OmoneyProviderError("Omoney FX returned no usable prices")
                 self._write_cache(rates, stale=stale)
                 return rates, stale
-            except OmoneyAuthError:
+            except OmoneyAuthError as exc:
+                # A rejected key never fixes itself by retrying, but publishing
+                # can continue from the last valid snapshot (clearly stale).
+                last_error = exc
+                log.error("omoney auth failed; falling back to cache if available: %s", exc)
+                break
+            except OmoneyUnrecognizedPayload:
+                # A schema/payload problem is not transient either.
                 raise
             except OmoneyRateLimitError as exc:
                 last_error = exc
@@ -196,6 +232,8 @@ class OmoneyProvider:
         if cached:
             log.warning("using cached Omoney FX snapshot after live fetch failure")
             return cached, True
+        if isinstance(last_error, OmoneyProviderError):
+            raise last_error
         raise OmoneyProviderError("Omoney FX fetch failed and no cache is available") from last_error
 
     def _request_prices(self) -> dict:
@@ -281,9 +319,6 @@ class OmoneyProvider:
             if name is None:
                 continue
             by_instrument[str(name).strip().upper()] = record
-            # Allow "BTC/USD"-style pairs to also match on their base code.
-            base = str(name).strip().upper().split("/")[0]
-            by_instrument.setdefault(base, record)
 
         if not by_instrument:
             observed = sorted({key for record in records for key in record})[:20]
@@ -291,38 +326,57 @@ class OmoneyProvider:
                 f"no instrument identifiers found in Omoney FX prices; observed fields: {observed}"
             )
 
+        snapshot_quote = ""
+        if isinstance(payload, dict):
+            snapshot_quote = str(payload.get("quote_currency") or "").strip().upper()
+
         rates: list[dict] = []
         missing: list[str] = []
+        stale_symbols: list[str] = []
         now = datetime.now(timezone.utc)
-        stale_any = False
 
-        for app_symbol, instrument in self.symbol_map.items():
-            record = by_instrument.get(instrument.strip().upper())
+        for app_symbol, spec in self.symbol_map.items():
+            instrument = spec["instrument"].strip().upper()
+            record = by_instrument.get(instrument)
             if record is None:
                 missing.append(instrument)
                 continue
 
-            price = _first(record, _PRICE_KEYS)
-            if price is None:
-                missing.append(f"{instrument} (no price field)")
+            status = str(_first(record, _STATUS_KEYS) or "").strip().lower()
+            if status in _UNAVAILABLE_STATUSES:
+                # Never publish an unavailable instrument as a price.
+                missing.append(f"{instrument} (status={status})")
                 continue
 
-            unit = _first(record, _UNIT_KEYS)
-            if unit is None:
-                # Never assume IRR vs IRT. Require an explicit unit.
+            field = str(spec.get("field") or "price")
+            price = _positive_number(record.get(field))
+            if price is None:
+                # e.g. sell_price is 0/null for some instruments: fall back to
+                # the mid price rather than publishing a zero.
+                price = _positive_number(_first(record, _PRICE_KEYS))
+            if price is None:
+                missing.append(f"{instrument} (no usable {field} or price)")
+                continue
+
+            unit = _first(record, _UNIT_KEYS) or snapshot_quote
+            if not unit:
+                # Never assume IRR vs IRT.
                 raise OmoneyUnrecognizedPayload(
-                    f"instrument {instrument} has no unit/quote field; refusing to guess IRR vs IRT"
+                    f"instrument {instrument} has no quote_currency; refusing to guess IRR vs IRT"
                 )
 
-            status = str(_first(record, _STATUS_KEYS) or "").strip().lower()
             updated_at = _parse_iso(_first(record, _TIMESTAMP_KEYS))
-            is_stale = status in {"stale", "expired", "unavailable", "error", "down"}
-            if updated_at is not None and now - updated_at > self.max_price_age:
+            age_seconds = record.get("age_seconds")
+            is_stale = status in _STALE_STATUSES
+            if isinstance(age_seconds, (int, float)) and age_seconds > self.max_price_age.total_seconds():
                 is_stale = True
-            if updated_at is None and not status:
-                # No freshness metadata at all: treat as stale rather than fresh.
+            elif updated_at is not None and now - updated_at > self.max_price_age:
                 is_stale = True
-            stale_any = stale_any or is_stale
+            elif updated_at is None and not status:
+                # No freshness metadata at all: never call it fresh.
+                is_stale = True
+            if is_stale:
+                stale_symbols.append(app_symbol)
 
             note = ""
             if updated_at is not None:
@@ -338,19 +392,21 @@ class OmoneyProvider:
                     "unit": str(unit).strip().upper(),
                     "note": note,
                     "instrument": instrument,
+                    "status": status,
                     "stale": is_stale,
                 }
             )
 
-        if missing:
-            available = ",".join(sorted(by_instrument))
+        if not rates:
             raise OmoneyProviderError(
-                "OMONEY_INSTRUMENT_UNKNOWN: could not map "
-                + ", ".join(sorted(missing))
-                + f" (available: {available})"
+                "OMONEY_NO_PRICES: no configured instrument could be resolved. "
+                "Missing: " + ", ".join(sorted(missing)) + f". Available: {','.join(sorted(by_instrument))}"
             )
+        if missing:
+            log.warning("omoney symbols skipped: %s", ", ".join(sorted(missing)))
 
-        return rates, stale_any
+        self.last_stale_symbols = stale_symbols
+        return rates, bool(stale_symbols)
 
     # ------------------------------------------------------------------- cache
 
