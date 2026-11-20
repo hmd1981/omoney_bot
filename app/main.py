@@ -41,11 +41,13 @@ from app.instagram_token import (
 )
 from app.ops_alerts import send_alert
 from app.rate_providers.navasan import NavasanProvider
+from app.rate_providers.omoney import OmoneyProvider
 from app.storage_client import R2StorageClient
 from app.telegram_client import TelegramClient
 
 BASE_DIR = Path("/app")
 CACHE_FILE = BASE_DIR / "cache" / "last_rates.json"
+OMONEY_CACHE_FILE = BASE_DIR / "cache" / "last_rates_omoney.json"
 OUTPUT_DIR = BASE_DIR / "output"
 LOG_DIR = BASE_DIR / "logs"
 PUBLISHED_SLOTS_FILE = LOG_DIR / "published-slots.jsonl"
@@ -109,10 +111,24 @@ def preview_path() -> Path:
     return OUTPUT_DIR / "premium-reference-style-preview.png"
 
 
+def rate_provider_name() -> str:
+    return os.getenv("CURRENCY_PROVIDER", "navasan").strip().lower() or "navasan"
+
+
+def build_rate_provider():
+    """Return the configured rate provider, preserving the shared interface."""
+    name = rate_provider_name()
+    if name == "navasan":
+        return NavasanProvider(CACHE_FILE)
+    if name == "omoney":
+        return OmoneyProvider(OMONEY_CACHE_FILE)
+    raise RuntimeError(f"CURRENCY_PROVIDER must be 'navasan' or 'omoney' (got {name!r})")
+
+
 def generate_image(image_path: Path) -> tuple[list[dict], bool]:
     zone = ZoneInfo(timezone_name())
     now = datetime.now(zone)
-    provider = NavasanProvider(CACHE_FILE)
+    provider = build_rate_provider()
     rates, used_cache = provider.fetch()
     generate_rate_image(
         rates=rates,
@@ -655,9 +671,12 @@ def main() -> None:
     parser.add_argument("--r2-cleanup", action="store_true", help="Delete old archived R2 media objects under allowed prefixes")
     args = parser.parse_args()
     if args.fetch_test:
-        result = NavasanProvider(CACHE_FILE).fetch_test()
-        log.info("fetch test source=%s count=%s symbols=%s", result["source"], result["count"], result["symbols"])
-        print(f"source={result['source']} count={result['count']} symbols={result['symbols']}")
+        try:
+            result = build_rate_provider().fetch_test()
+        except RuntimeError as exc:
+            raise SystemExit(f"error: {exc}") from None
+        log.info("fetch test provider=%s source=%s count=%s symbols=%s", rate_provider_name(), result["source"], result["count"], result["symbols"])
+        print(f"provider={rate_provider_name()} source={result['source']} count={result['count']} symbols={result['symbols']}")
         return
     if args.print_caption:
         slot_id = current_slot()

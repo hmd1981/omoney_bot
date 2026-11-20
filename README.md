@@ -188,6 +188,65 @@ docker compose ps
 docker compose logs --tail=50 omoney-rates-bot-second
 ```
 
+## Currency rate provider
+
+Rates come from a pluggable provider selected with `CURRENCY_PROVIDER`:
+
+| Value | Provider | Notes |
+|---|---|---|
+| `navasan` | Navasan (legacy) | current default |
+| `omoney` | Omoney FX API | `https://fx.omoney.online` |
+
+```env
+CURRENCY_PROVIDER=navasan          # switch to omoney to cut over
+OMONEY_FX_BASE_URL=https://fx.omoney.online
+OMONEY_FX_API_KEY=                 # set with scripts/set-omoney-key.sh
+```
+
+### Storing the API key securely
+
+```bash
+./scripts/set-omoney-key.sh
+```
+
+Reads the key with input hidden, writes it to `.env` with mode `0600`, and
+prints only a masked confirmation (`****1234`). It does **not** change
+`CURRENCY_PROVIDER`, so live publishing keeps using the current provider.
+
+### Validating Omoney FX without touching production
+
+```bash
+docker compose run --rm -e CURRENCY_PROVIDER=omoney omoney-rates-bot \
+  python -m app.main --fetch-test
+```
+
+This exercises the real endpoint and the symbol mapping while the scheduler
+keeps running on the current provider. `--fetch-test` reports
+`provider=`, `source=live|cache`, `count=`, and `symbols=`.
+
+### Behaviour
+
+- Bounded timeouts: `OMONEY_FX_CONNECT_TIMEOUT` (5s) and
+  `OMONEY_FX_READ_TIMEOUT` (15s).
+- Up to `OMONEY_FX_MAX_ATTEMPTS` (3) attempts with capped backoff;
+  `Retry-After` is honoured on 429, capped at `OMONEY_FX_MAX_RETRY_SLEEP`.
+- 401 fails fast and never retries. A rejected key raises
+  `OMONEY_FX_UNAUTHORIZED`.
+- Prices older than `OMONEY_FX_MAX_PRICE_AGE_MINUTES` (240), or flagged
+  stale/unavailable by the API, are treated as stale: the image shows the
+  "Last cached update" note rather than presenting them as fresh.
+- A missing unit/quote field raises rather than assuming IRR — rial and toman
+  are never silently substituted.
+- Snapshots are cached in `cache/last_rates_omoney.json`, separate from the
+  Navasan cache so the two providers' units can never mix.
+- `OMONEY_SYMBOLS` overrides the app_symbol=INSTRUMENT mapping; an unmatched
+  instrument raises `OMONEY_INSTRUMENT_UNKNOWN` and lists what the API offers.
+
+### Rollback
+
+Set `CURRENCY_PROVIDER=navasan` and run `docker compose up -d --force-recreate`.
+The Navasan code path and its cache are untouched.
+
 ## Health and logs
 
 ```bash

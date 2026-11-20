@@ -198,11 +198,12 @@ def _row(draw: ImageDraw.ImageDraw, row: dict, top: int, *, large: bool = False)
     draw.rounded_rectangle((badge_x, badge_y, badge_x + bw + _s(26), badge_y + _s(30)), radius=_s(15), fill=GLASS, outline=GOLD_DIM, width=_s(1))
     draw.text((badge_x + _s(13), badge_y + _s(3)), row["code"], fill=GOLD, font=badge_font)
     price = row["value"]
+    unit_text = str(row.get("unit") or "IRR").strip().upper()[:8] or "IRR"
     pw, _ = _size(draw, price, price_font)
-    ux, _ = _size(draw, "IRR", unit_font)
+    ux, _ = _size(draw, unit_text, unit_font)
     right = _s(932)
     draw.text((right - pw, y + _s(18)), price, fill=GOLD_BRIGHT, font=price_font)
-    draw.text((right - ux, y + _s(70)), "IRR", fill=MUTED, font=unit_font)
+    draw.text((right - ux, y + _s(70)), unit_text, fill=MUTED, font=unit_font)
 
 
 def generate_rate_image(
