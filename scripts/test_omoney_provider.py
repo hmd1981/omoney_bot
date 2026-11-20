@@ -201,9 +201,11 @@ def main() -> int:
 
     # 9. stale flagged, not presented as fresh
     result, state, provider, _ = run("stale")
-    rs, stale = result
-    check("stale rows flagged", stale is True and all(r["status"] == "stale" for r in rs),
-          f"stale={stale}")
+    rs, live = result
+    check("stale rows flagged, feed still live",
+          live is False and all(r["status"] == "stale" for r in rs)
+          and set(provider.last_stale_symbols) == {r["symbol"] for r in rs},
+          f"live={live} delayed={len(provider.last_stale_symbols)}")
 
     # 10. zero sell_price falls back to mid, never publishes 0
     result, state, provider, _ = run("zero_sell")

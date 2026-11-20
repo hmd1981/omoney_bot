@@ -130,6 +130,12 @@ def generate_image(image_path: Path) -> tuple[list[dict], bool]:
     now = datetime.now(zone)
     provider = build_rate_provider()
     rates, used_cache = provider.fetch()
+    if used_cache:
+        update_note = "Last cached update"
+    else:
+        delayed = getattr(provider, "last_stale_symbols", []) or []
+        labels = [str(rate.get("label") or rate.get("symbol")) for rate in rates if rate.get("symbol") in delayed]
+        update_note = f"Delayed: {', '.join(labels)}" if labels else ""
     generate_rate_image(
         rates=rates,
         image_path=image_path,
@@ -138,7 +144,7 @@ def generate_image(image_path: Path) -> tuple[list[dict], bool]:
         website=os.getenv("WEBSITE", "https://omoney.online"),
         phone=os.getenv("PHONE", "+96896129711"),
         published_at=now,
-        update_note="Last cached update" if used_cache else "",
+        update_note=update_note,
     )
     return rates, used_cache
 

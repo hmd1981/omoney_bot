@@ -38,6 +38,9 @@ DEFAULT_SYMBOL_MAP: dict[str, dict[str, str]] = {
     "omr": {"instrument": "OMR", "field": "price"},
     "btc": {"instrument": "BTC", "field": "price"},
     "usdt": {"instrument": "USDT", "field": "price"},
+    # Replaces the retired 18K gram-gold row. SEKKEH is the new-design Emami
+    # gold coin quoted in toman, so it renders in the GOLD MARKET section.
+    "sekkeh": {"instrument": "SEKKEH", "field": "price"},
 }
 
 DISPLAY_LABELS = {
@@ -51,6 +54,7 @@ DISPLAY_LABELS = {
     "usdt": "USDT",
     "18ayar": "Gold 18K",
     "gold_18k": "Gold 18K",
+    "sekkeh": "Emami Coin",
     "sekke": "Coin",
 }
 
@@ -205,9 +209,12 @@ class OmoneyProvider:
         for attempt in range(1, self.max_attempts + 1):
             try:
                 payload = self._request_prices()
-                rates, stale = self._normalize(payload)
-                self._write_cache(rates, stale=stale)
-                return rates, stale
+                rates, _ = self._normalize(payload)
+                # Data is live even when an individual instrument is stale;
+                # per-row staleness is exposed via last_stale_symbols so the
+                # caller can label it without claiming the whole feed is cached.
+                self._write_cache(rates, stale=bool(self.last_stale_symbols))
+                return rates, False
             except OmoneyAuthError as exc:
                 # A rejected key never fixes itself by retrying, but publishing
                 # can continue from the last valid snapshot (clearly stale).
